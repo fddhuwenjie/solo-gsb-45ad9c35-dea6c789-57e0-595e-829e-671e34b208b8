@@ -1456,6 +1456,208 @@ def run(client):
     check("same arrival and transfers: lexicographically smaller sequence wins",
           [l["service_id"] for l in lg["legs"]] == ["SVC-A", "SVC-Z"])
 
+    # Merge counterexample for station pruning: two paths reach hub N one
+    # after the other. The earlier one (X,Y, at 08:30) rode more services;
+    # the later one (Z, at 08:35) rode fewer. Both catch the same final run
+    # W (09:00) and reach T together at 10:00, so Z,W with one transfer must
+    # win. A single best-label-per-station search discarded the Z label at N.
+    merge_body = {
+        "replan_id": "dr-merge-fewer-rides", "min_transfer_seconds": 300,
+        "services": [
+            {"service_id": "X", "capacity": 100, "stops": [
+                {"station_id": "S", "arrival_at": "2026-09-27T08:00:00Z",
+                 "departure_at": "2026-09-27T08:00:00Z"},
+                {"station_id": "M", "arrival_at": "2026-09-27T08:10:00Z",
+                 "departure_at": "2026-09-27T08:20:00Z"}]},
+            {"service_id": "Y", "capacity": 100, "stops": [
+                {"station_id": "M", "arrival_at": "2026-09-27T08:20:00Z",
+                 "departure_at": "2026-09-27T08:20:00Z"},
+                {"station_id": "N", "arrival_at": "2026-09-27T08:30:00Z",
+                 "departure_at": "2026-09-27T08:30:00Z"}]},
+            {"service_id": "Z", "capacity": 100, "stops": [
+                {"station_id": "S", "arrival_at": "2026-09-27T08:00:00Z",
+                 "departure_at": "2026-09-27T08:00:00Z"},
+                {"station_id": "N", "arrival_at": "2026-09-27T08:35:00Z",
+                 "departure_at": "2026-09-27T08:35:00Z"}]},
+            {"service_id": "W", "capacity": 100, "stops": [
+                {"station_id": "N", "arrival_at": "2026-09-27T09:00:00Z",
+                 "departure_at": "2026-09-27T09:00:00Z"},
+                {"station_id": "T", "arrival_at": "2026-09-27T10:00:00Z",
+                 "departure_at": "2026-09-27T10:00:00Z"}]},
+        ],
+        "groups": [{"group_id": "m", "origin": "S", "destination": "T",
+                    "ready_at": "2026-09-27T08:00:00Z", "party_size": 1}],
+    }
+    mg = client.post("/disruption/replans", json=merge_body).json()["groups"][0]
+    check("later label with fewer rides wins at the merge station",
+          mg["status"] == "assigned" and mg["arrival_at"] == "2026-09-27T10:00:00Z"
+          and mg["transfers"] == 1
+          and [l["service_id"] for l in mg["legs"]] == ["Z", "W"])
+
+    # The retained longer label must still be chosen when the shorter label
+    # cannot make the onward connection: W leaves N in the 08:30..08:35 gap,
+    # so only X,Y catches it (300s gap honoured exactly at 08:36).
+    merge_gap = json.loads(json.dumps(merge_body))
+    merge_gap["replan_id"] = "dr-merge-gap"
+    merge_gap["services"][3]["stops"][0]["arrival_at"] = "2026-09-27T08:36:00Z"
+    merge_gap["services"][3]["stops"][0]["departure_at"] = "2026-09-27T08:36:00Z"
+    gg = client.post("/disruption/replans", json=merge_gap).json()["groups"][0]
+    check("merge: the early longer label wins when the late one misses W",
+          gg["transfers"] == 2
+          and [l["service_id"] for l in gg["legs"]] == ["X", "Y", "W"])
+
+    # Lexicographic merge: equal ride counts at N (2 each), the label with
+    # the smaller service-id prefix arrives later but both catch W; the
+    # non-dominated search must still apply the sequence tie-break.
+    merge_lex_body = {
+        "replan_id": "dr-merge-lex", "min_transfer_seconds": 0,
+        "services": [
+            {"service_id": "LONG-B", "capacity": 100, "stops": [
+                {"station_id": "S", "arrival_at": "2026-09-27T08:00:00Z",
+                 "departure_at": "2026-09-27T08:00:00Z"},
+                {"station_id": "P", "arrival_at": "2026-09-27T08:10:00Z",
+                 "departure_at": "2026-09-27T08:10:00Z"},
+                {"station_id": "N", "arrival_at": "2026-09-27T08:20:00Z",
+                 "departure_at": "2026-09-27T08:20:00Z"}]},
+            {"service_id": "LONG-A", "capacity": 100, "stops": [
+                {"station_id": "S", "arrival_at": "2026-09-27T08:00:00Z",
+                 "departure_at": "2026-09-27T08:00:00Z"},
+                {"station_id": "Q", "arrival_at": "2026-09-27T08:10:00Z",
+                 "departure_at": "2026-09-27T08:10:00Z"},
+                {"station_id": "N", "arrival_at": "2026-09-27T08:25:00Z",
+                 "departure_at": "2026-09-27T08:25:00Z"}]},
+            {"service_id": "W", "capacity": 100, "stops": [
+                {"station_id": "N", "arrival_at": "2026-09-27T09:00:00Z",
+                 "departure_at": "2026-09-27T09:00:00Z"},
+                {"station_id": "T", "arrival_at": "2026-09-27T10:00:00Z",
+                 "departure_at": "2026-09-27T10:00:00Z"}]},
+        ],
+        "groups": [{"group_id": "m", "origin": "S", "destination": "T",
+                    "ready_at": "2026-09-27T08:00:00Z", "party_size": 1}],
+    }
+    mlg = client.post("/disruption/replans", json=merge_lex_body).json()["groups"][0]
+    check("merge keeps the lexicographic sequence tie-break",
+          [l["service_id"] for l in mlg["legs"]] == ["LONG-A", "W"])
+
+    # Per-section capacity across the merge: the shorter R,W itinerary wins
+    # for the first group and consumes W's single N->U seat; the retained
+    # longer label P,Q (Q continues N->U) then rescues the second group via
+    # V1 at U -- both groups reach V at 09:50. Single-label pruning strands
+    # c2. W's single U->V seat is irrelevant to the rescue.
+    merge_cap_body = {
+        "replan_id": "dr-merge-capacity", "min_transfer_seconds": 300,
+        "services": [
+            {"service_id": "P", "capacity": 100, "stops": [
+                {"station_id": "S", "arrival_at": "2026-09-27T08:00:00Z",
+                 "departure_at": "2026-09-27T08:00:00Z"},
+                {"station_id": "K", "arrival_at": "2026-09-27T08:10:00Z",
+                 "departure_at": "2026-09-27T08:20:00Z"}]},
+            {"service_id": "Q", "capacity": 100, "stops": [
+                {"station_id": "K", "arrival_at": "2026-09-27T08:20:00Z",
+                 "departure_at": "2026-09-27T08:20:00Z"},
+                {"station_id": "N", "arrival_at": "2026-09-27T08:30:00Z",
+                 "departure_at": "2026-09-27T08:30:00Z"},
+                {"station_id": "U", "arrival_at": "2026-09-27T09:15:00Z",
+                 "departure_at": "2026-09-27T09:15:00Z"}]},
+            {"service_id": "R", "capacity": 100, "stops": [
+                {"station_id": "S", "arrival_at": "2026-09-27T08:00:00Z",
+                 "departure_at": "2026-09-27T08:00:00Z"},
+                {"station_id": "N", "arrival_at": "2026-09-27T08:35:00Z",
+                 "departure_at": "2026-09-27T08:35:00Z"}]},
+            {"service_id": "W", "capacity": 1, "stops": [
+                {"station_id": "N", "arrival_at": "2026-09-27T09:00:00Z",
+                 "departure_at": "2026-09-27T09:00:00Z"},
+                {"station_id": "U", "arrival_at": "2026-09-27T09:30:00Z",
+                 "departure_at": "2026-09-27T09:30:00Z"},
+                {"station_id": "V", "arrival_at": "2026-09-27T09:50:00Z",
+                 "departure_at": "2026-09-27T09:50:00Z"}]},
+            {"service_id": "V1", "capacity": 100, "stops": [
+                {"station_id": "U", "arrival_at": "2026-09-27T09:25:00Z",
+                 "departure_at": "2026-09-27T09:25:00Z"},
+                {"station_id": "V", "arrival_at": "2026-09-27T09:50:00Z",
+                 "departure_at": "2026-09-27T09:50:00Z"}]},
+        ],
+        "groups": [
+            {"group_id": "c1", "origin": "S", "destination": "V",
+             "ready_at": "2026-09-27T08:00:00Z", "party_size": 1},
+            {"group_id": "c2", "origin": "S", "destination": "V",
+             "ready_at": "2026-09-27T08:00:00Z", "party_size": 1},
+        ],
+    }
+    mcap = client.post("/disruption/replans", json=merge_cap_body).json()
+    mcb = {g["group_id"]: g for g in mcap["groups"]}
+    check("capacity merge: first group rides the shorter R,W itinerary",
+          mcb["c1"]["status"] == "assigned" and mcb["c1"]["transfers"] == 1
+          and [(l["service_id"], l["from_station"], l["to_station"])
+                for l in mcb["c1"]["legs"]]
+          == [("R", "S", "N"), ("W", "N", "V")])
+    check("capacity merge: the retained longer label carries the second group",
+          mcb["c2"]["status"] == "assigned" and mcb["c2"]["transfers"] == 2
+          and [(l["service_id"], l["from_station"], l["to_station"])
+                for l in mcb["c2"]["legs"]]
+          == [("P", "S", "K"), ("Q", "K", "U"), ("V1", "U", "V")]
+          and mcb["c2"]["arrival_at"] == "2026-09-27T09:50:00Z")
+
+    # Removing the V1 bypass leaves W's 1-seat N->U section as the only way
+    # through: a party of 2 must be stranded with insufficient_capacity
+    # (the unconstrained search proves V reachable), never with an
+    # infeasible label chosen as assigned.
+    merge_block = json.loads(json.dumps(merge_cap_body))
+    merge_block["replan_id"] = "dr-merge-blocked"
+    merge_block["services"] = [
+        s for s in merge_block["services"] if s["service_id"] != "V1"
+    ]
+    merge_block["groups"] = [
+        {"group_id": "c3", "origin": "S", "destination": "V",
+         "ready_at": "2026-09-27T08:00:00Z", "party_size": 2}
+    ]
+    c3 = client.post("/disruption/replans", json=merge_block).json()["groups"][0]
+    check("capacity merge: oversized party stranded, no infeasible label chosen",
+          c3["status"] == "stranded"
+          and c3["stranded_reason"].startswith("insufficient_capacity"))
+
+    # Pure per-section ledger: capacities are independent on each section.
+    # A group consuming N->U->V blocks a later party boarding at U for
+    # U->V; a group alighting at U leaves U->V free.
+    section_body = {
+        "replan_id": "dr-sections", "min_transfer_seconds": 0,
+        "services": [
+            {"service_id": "R", "capacity": 100, "stops": [
+                {"station_id": "S", "arrival_at": "2026-09-27T08:00:00Z",
+                 "departure_at": "2026-09-27T08:00:00Z"},
+                {"station_id": "N", "arrival_at": "2026-09-27T08:35:00Z",
+                 "departure_at": "2026-09-27T08:35:00Z"}]},
+            {"service_id": "W", "capacity": 1, "stops": [
+                {"station_id": "N", "arrival_at": "2026-09-27T09:00:00Z",
+                 "departure_at": "2026-09-27T09:00:00Z"},
+                {"station_id": "U", "arrival_at": "2026-09-27T09:30:00Z",
+                 "departure_at": "2026-09-27T09:30:00Z"},
+                {"station_id": "V", "arrival_at": "2026-09-27T09:50:00Z",
+                 "departure_at": "2026-09-27T09:50:00Z"}]},
+        ],
+        "groups": [
+            {"group_id": "s1", "origin": "S", "destination": "V",
+             "ready_at": "2026-09-27T08:00:00Z", "party_size": 1},
+            {"group_id": "s2", "origin": "U", "destination": "V",
+             "ready_at": "2026-09-27T09:25:00Z", "party_size": 1},
+        ],
+    }
+    sec_res = client.post("/disruption/replans", json=section_body).json()
+    sec_by = {g["group_id"]: g for g in sec_res["groups"]}
+    check("per-section: consumed U->V blocks the later boarding party",
+          sec_by["s1"]["status"] == "assigned"
+          and sec_by["s2"]["status"] == "stranded"
+          and sec_by["s2"]["stranded_reason"].startswith("insufficient_capacity"))
+    section_free = json.loads(json.dumps(section_body))
+    section_free["replan_id"] = "dr-sections-free"
+    section_free["groups"][0]["destination"] = "U"
+    free_res = client.post("/disruption/replans", json=section_free).json()
+    free_by = {g["group_id"]: g for g in free_res["groups"]}
+    check("per-section: alighting at U keeps U->V available",
+          free_by["s1"]["status"] == "assigned"
+          and free_by["s2"]["status"] == "assigned"
+          and [l["service_id"] for l in free_by["s2"]["legs"]] == ["W"])
+
     # Idempotency: array order and offset notation do not matter; different
     # payload -> 409.
     r = client.post("/disruption/replans", json=replan_body)
@@ -1535,9 +1737,13 @@ def run(client):
     with sqlite3.connect(os.environ["DB_PATH"]) as raw:
         ids = [row[0] for row in raw.execute(
             "SELECT replan_id FROM disruption_replans ORDER BY replan_id")]
-        # Main + tie bodies; replays, 409s and 422s added nothing.
+        # Main + tie/merge/section bodies; replays, 409s and 422s added nothing.
         check("only valid replans persisted",
-              ids == ["dr-2026-09-27-a", "dr-tie-lex", "dr-tie-transfers"])
+              ids == ["dr-2026-09-27-a", "dr-merge-blocked",
+                      "dr-merge-capacity", "dr-merge-fewer-rides",
+                      "dr-merge-gap", "dr-merge-lex", "dr-sections",
+                      "dr-sections-free", "dr-tie-lex",
+                      "dr-tie-transfers"])
         blocked = []
         for stmt in (
             "UPDATE disruption_replans SET assigned_count = 0"
