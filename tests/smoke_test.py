@@ -18,7 +18,8 @@ whole-class suppression, half-open trip window, idempotency/409 conflict,
 GET query, isolated append-only tables with no business or audit side effects),
 the sudden-disruption replan endpoints (earliest-arrival itineraries under
 per-section capacity, minimum transfer seconds, fewer-transfers/lexicographic
-service-sequence tie-breaks, (ready_at, group_id) processing order, indivisible
+service-sequence tie-breaks, non-dominated label fronts where itineraries
+merge at a transfer station, (ready_at, group_id) processing order, indivisible
 parties, per-section seat deduction, stranded reasons, timetable uniqueness and
 monotonicity validation, idempotency/409 conflict, GET query, isolated
 append-only tables with no business or audit side effects),
@@ -1456,6 +1457,133 @@ def run(client):
     check("same arrival and transfers: lexicographically smaller sequence wins",
           [l["service_id"] for l in lg["legs"]] == ["SVC-A", "SVC-Z"])
 
+    # Merge counterexample: two itineraries converge at transfer station X.
+    # The earlier one (LEG-1 + LEG-2, reaches X 08:30) has already used two
+    # rides; the later one (DIRECT-LATE, reaches X 08:40) only one. Both can
+    # board the same FINAL service and arrive at D together, so the later /
+    # fewer-rides label must survive the merge and win the transfers
+    # tie-break. A single-label-per-station search would discard it here.
+    merge_body = {
+        "replan_id": "dr-merge-counter", "min_transfer_seconds": 300,
+        "services": [
+            {"service_id": "LEG-1", "capacity": 10, "stops": [
+                {"station_id": "O", "arrival_at": "2026-09-27T08:00:00Z",
+                 "departure_at": "2026-09-27T08:00:00Z"},
+                {"station_id": "P", "arrival_at": "2026-09-27T08:10:00Z",
+                 "departure_at": "2026-09-27T08:15:00Z"}]},
+            {"service_id": "LEG-2", "capacity": 10, "stops": [
+                {"station_id": "P", "arrival_at": "2026-09-27T08:20:00Z",
+                 "departure_at": "2026-09-27T08:20:00Z"},
+                {"station_id": "X", "arrival_at": "2026-09-27T08:30:00Z",
+                 "departure_at": "2026-09-27T08:30:00Z"}]},
+            {"service_id": "DIRECT-LATE", "capacity": 10, "stops": [
+                {"station_id": "O", "arrival_at": "2026-09-27T08:20:00Z",
+                 "departure_at": "2026-09-27T08:20:00Z"},
+                {"station_id": "X", "arrival_at": "2026-09-27T08:40:00Z",
+                 "departure_at": "2026-09-27T08:40:00Z"}]},
+            {"service_id": "FINAL", "capacity": 10, "stops": [
+                {"station_id": "X", "arrival_at": "2026-09-27T09:00:00Z",
+                 "departure_at": "2026-09-27T09:00:00Z"},
+                {"station_id": "D", "arrival_at": "2026-09-27T09:30:00Z",
+                 "departure_at": "2026-09-27T09:30:00Z"}]},
+        ],
+        "groups": [
+            {"group_id": "m1", "origin": "O", "destination": "D",
+             "ready_at": "2026-09-27T08:00:00Z", "party_size": 1},
+        ],
+    }
+    r = client.post("/disruption/replans", json=merge_body)
+    check("merge counterexample replan created", r.status_code == 200)
+    mg = r.json()["groups"][0]
+    check("merge at X: later fewer-rides label wins the transfers tie-break",
+          mg["status"] == "assigned" and mg["arrival_at"] == "2026-09-27T09:30:00Z"
+          and mg["transfers"] == 1
+          and [l["service_id"] for l in mg["legs"]] == ["DIRECT-LATE", "FINAL"])
+
+    # Same merge, but the later direct service reaches X only 240s before
+    # FINAL departs (< 300s minimum transfer): it cannot board, so the
+    # earlier more-rides itinerary is the feasible winner -- the earlier
+    # label must survive the merge too.
+    missed_body = json.loads(json.dumps(merge_body))
+    missed_body["replan_id"] = "dr-merge-missed"
+    missed_body["services"][2]["stops"][1]["arrival_at"] = "2026-09-27T08:56:00Z"
+    missed_body["services"][2]["stops"][1]["departure_at"] = "2026-09-27T08:56:00Z"
+    r = client.post("/disruption/replans", json=missed_body)
+    mg = r.json()["groups"][0]
+    check("merge at X: late label missing the transfer gap loses",
+          mg["status"] == "assigned" and mg["arrival_at"] == "2026-09-27T09:30:00Z"
+          and mg["transfers"] == 2
+          and [l["service_id"] for l in mg["legs"]] == ["LEG-1", "LEG-2", "FINAL"])
+
+    # Same merge under capacity pressure: FINAL carries a single seat, taken
+    # by the earlier-processed group e0. The capacity-infeasible label via
+    # FINAL must not be chosen; both merge labels fall back to FINAL-2 and
+    # the fewer-rides one still wins.
+    cap_merge_body = json.loads(json.dumps(merge_body))
+    cap_merge_body["replan_id"] = "dr-merge-capacity"
+    cap_merge_body["services"][3]["capacity"] = 1
+    cap_merge_body["services"].append(
+        {"service_id": "FINAL-2", "capacity": 10, "stops": [
+            {"station_id": "X", "arrival_at": "2026-09-27T10:00:00Z",
+             "departure_at": "2026-09-27T10:00:00Z"},
+            {"station_id": "D", "arrival_at": "2026-09-27T10:30:00Z",
+             "departure_at": "2026-09-27T10:30:00Z"}]})
+    cap_merge_body["groups"].insert(
+        0, {"group_id": "e0", "origin": "X", "destination": "D",
+            "ready_at": "2026-09-27T08:00:00Z", "party_size": 1})
+    r = client.post("/disruption/replans", json=cap_merge_body)
+    cm = {g["group_id"]: g for g in r.json()["groups"]}
+    check("capacity merge: earlier group takes the last FINAL seat",
+          cm["e0"]["status"] == "assigned"
+          and [l["service_id"] for l in cm["e0"]["legs"]] == ["FINAL"])
+    check("capacity merge: infeasible label skipped, fewer rides still wins",
+          cm["m1"]["status"] == "assigned"
+          and cm["m1"]["arrival_at"] == "2026-09-27T10:30:00Z"
+          and cm["m1"]["transfers"] == 1
+          and [l["service_id"] for l in cm["m1"]["legs"]] == ["DIRECT-LATE", "FINAL-2"])
+
+    # Per-section capacity: one service, two adjacent sections, capacity 4
+    # each. A 4-person S1->S2 group fills only the first section; a 4-person
+    # S2->S3 group still fits the second; a 1-person S1->S3 party needs both
+    # and is stranded by the exhausted first section, as is the next
+    # S1->S2 party.
+    section_body = {
+        "replan_id": "dr-section-capacity", "min_transfer_seconds": 300,
+        "services": [
+            {"service_id": "SEC", "capacity": 4, "stops": [
+                {"station_id": "S1", "arrival_at": "2026-09-27T08:00:00Z",
+                 "departure_at": "2026-09-27T08:05:00Z"},
+                {"station_id": "S2", "arrival_at": "2026-09-27T08:20:00Z",
+                 "departure_at": "2026-09-27T08:25:00Z"},
+                {"station_id": "S3", "arrival_at": "2026-09-27T08:40:00Z",
+                 "departure_at": "2026-09-27T08:40:00Z"}]},
+        ],
+        "groups": [
+            {"group_id": "g1", "origin": "S1", "destination": "S2",
+             "ready_at": "2026-09-27T08:00:00Z", "party_size": 4},
+            {"group_id": "g2", "origin": "S2", "destination": "S3",
+             "ready_at": "2026-09-27T08:00:00Z", "party_size": 4},
+            {"group_id": "g3", "origin": "S1", "destination": "S3",
+             "ready_at": "2026-09-27T08:00:00Z", "party_size": 1},
+            {"group_id": "g4", "origin": "S1", "destination": "S2",
+             "ready_at": "2026-09-27T08:00:00Z", "party_size": 1},
+        ],
+    }
+    r = client.post("/disruption/replans", json=section_body)
+    sg = {g["group_id"]: g for g in r.json()["groups"]}
+    check("per-section: first section filled by g1",
+          sg["g1"]["status"] == "assigned"
+          and sg["g1"]["arrival_at"] == "2026-09-27T08:20:00Z")
+    check("per-section: second section stays independent for g2",
+          sg["g2"]["status"] == "assigned"
+          and sg["g2"]["arrival_at"] == "2026-09-27T08:40:00Z")
+    check("per-section: g3 blocked by the one full section",
+          sg["g3"]["status"] == "stranded"
+          and sg["g3"]["stranded_reason"].startswith("insufficient_capacity"))
+    check("per-section: g4 finds no seat on the exhausted section",
+          sg["g4"]["status"] == "stranded"
+          and sg["g4"]["stranded_reason"].startswith("insufficient_capacity"))
+
     # Idempotency: array order and offset notation do not matter; different
     # payload -> 409.
     r = client.post("/disruption/replans", json=replan_body)
@@ -1535,9 +1663,11 @@ def run(client):
     with sqlite3.connect(os.environ["DB_PATH"]) as raw:
         ids = [row[0] for row in raw.execute(
             "SELECT replan_id FROM disruption_replans ORDER BY replan_id")]
-        # Main + tie bodies; replays, 409s and 422s added nothing.
+        # Main + tie/merge/section bodies; replays, 409s and 422s added nothing.
         check("only valid replans persisted",
-              ids == ["dr-2026-09-27-a", "dr-tie-lex", "dr-tie-transfers"])
+              ids == ["dr-2026-09-27-a", "dr-merge-capacity", "dr-merge-counter",
+                      "dr-merge-missed", "dr-section-capacity",
+                      "dr-tie-lex", "dr-tie-transfers"])
         blocked = []
         for stmt in (
             "UPDATE disruption_replans SET assigned_count = 0"

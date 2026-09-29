@@ -11,13 +11,22 @@ the seats already consumed. A group that cannot be carried at all is reported
 with the first obstruction it meets (unserved endpoint, unreachable
 destination, or insufficient section capacity).
 
-The search is a label-setting shortest path over stations. A label at a station
-is ``(arrival_at, rides, service_ids)``; riding a service that calls at the
-current station extends a label to any later stop on that service, provided the
-party is ready in time (the ``min_transfer_seconds`` gap is enforced between
-different services, never for the first boarding) and every traversed section
-still has enough remaining capacity. Services are never reused within one
-itinerary: revisiting a service cannot beat simply staying on it.
+The search is a multi-label shortest path over stations. A label at a station
+is ``(arrival_at, rides, service_ids)`` plus the stations/services it has
+used; riding a service that calls at the current station extends a label to
+any later stop on that service, provided the party is ready in time (the
+``min_transfer_seconds`` gap is enforced between different services, never
+for the first boarding) and every traversed section still has enough
+remaining capacity. Services are never reused within one itinerary:
+revisiting a service cannot beat simply staying on it.
+
+Each station keeps every settled label that is still non-dominated (see
+``_dominates``) instead of a single best one: when two itineraries converge
+at a transfer station, the one that arrives earlier but has already used
+more rides does not necessarily win -- the later one may board the same
+final service, arrive at the destination at the same moment and then take
+the fewer-transfers tie-break. Discarding it early would lose exactly those
+optima.
 
 Results are computed once and frozen by the caller: this module is a pure
 function of its inputs and mutates only the in-memory capacity ledger.
@@ -76,6 +85,30 @@ class _Assignment:
     transfers: int
 
 
+def _dominates(a: tuple, b: tuple) -> bool:
+    """True when label ``a`` makes same-station label ``b`` unable to win.
+
+    Labels are ``(arrival_at, rides, service_ids, used_services, visited)``.
+    ``a`` must arrive no later and use no more rides; when the ride counts
+    tie, its service-id sequence must be lexicographically no greater (the
+    final tie-break; with fewer rides ``a`` already wins on transfers, so the
+    sequences are only compared at equal length). Additionally every
+    continuation still open to ``b`` -- services not yet used and stations
+    not yet visited -- must also be open to ``a``; otherwise ``b`` might
+    reach the destination along a route ``a`` can no longer take. Capacity
+    needs no say here: the remaining section capacity of any continuation is the
+    same for both labels, so a completion feasible for ``b`` is feasible for
+    ``a`` as well, and scores no better.
+    """
+    a_time, a_rides, a_ids, a_used, a_visited = a
+    b_time, b_rides, b_ids, b_used, b_visited = b
+    if a_time > b_time or a_rides > b_rides:
+        return False
+    if a_rides == b_rides and a_ids > b_ids:
+        return False
+    return a_used <= b_used and a_visited <= b_visited
+
+
 @dataclass
 class _Planner:
     services: list[Service]
@@ -112,12 +145,22 @@ class _Planner:
         ``(arrival_at, rides, service_ids)``. Returns None when no itinerary
         reaches the destination under the current constraints.
 
-        The heap key is exactly that objective tuple, so the first label popped
-        at the destination is the optimum: every extension only moves arrival
-        later, adds a ride and appends to the service sequence. Labels that
-        revisit a station or a service are never generated -- an itinerary with
-        such a loop is strictly worse (later arrival, more rides) than the same
-        itinerary with the loop removed, so it can never be optimal.
+        Every station keeps the Pareto front of its settled labels: a label
+        is discarded only when a settled same-station label dominates it
+        (``_dominates``), i.e. the kept label is at least as good on every
+        component of the objective and can still take every continuation the
+        discarded one could. This is what lets a later-arriving but
+        fewer-rides itinerary survive at a transfer station when both can
+        board the same final service and arrive together.
+
+        The heap key is exactly the objective tuple, so the first label
+        popped at the destination is the optimum: every extension only moves
+        arrival later, adds a ride and appends to the service sequence, and
+        any label pruned along the way is matched by a surviving label whose
+        best completion is at least as good. Labels that revisit a station
+        or a service are never generated -- an itinerary with such a loop is
+        strictly worse (later arrival, more rides) than the same itinerary
+        with the loop removed, so it can never be optimal.
         """
         # Empty-leg journeys (origin == destination) are always trivially
         # feasible and consume no capacity.
@@ -128,8 +171,9 @@ class _Planner:
         heap: list = [
             (group.ready_at, 0, (), group.origin, (group.origin,), ())
         ]
-        # Smallest objective tuple settled at each station so far.
-        best: dict[str, tuple[datetime, int, tuple[str, ...]]] = {}
+        # Non-dominated settled labels per station, each stored as
+        # (arrival_at, rides, service_ids, used_services, visited_stations).
+        settled: dict[str, list[tuple]] = {}
 
         while heap:
             arrived_at, rides, service_ids, station, visited, legs = heapq.heappop(heap)
@@ -137,10 +181,21 @@ class _Planner:
                 return _Assignment(
                     legs, service_ids, arrived_at, rides - 1 if rides else 0
                 )
-            current = (arrived_at, rides, service_ids)
-            if best.get(station) is not None and best[station] <= current:
+            current = (
+                arrived_at,
+                rides,
+                service_ids,
+                frozenset(service_ids),
+                frozenset(visited),
+            )
+            labels = settled.get(station, [])
+            if any(_dominates(kept, current) for kept in labels):
                 continue
-            best[station] = current
+            # Settle the label: it joins the front and evicts any settled
+            # label it now dominates.
+            labels = [kept for kept in labels if not _dominates(current, kept)]
+            labels.append(current)
+            settled[station] = labels
 
             for svc in self.calling.get(station, []):
                 if svc.service_id in service_ids:
@@ -161,6 +216,21 @@ class _Planner:
                     if next_station in visited:
                         continue
                     next_arrival = svc.stops[alight].arrival_at
+                    next_ids = service_ids + (svc.service_id,)
+                    # A candidate already dominated by a settled label at its
+                    # station can never win; don't push it.
+                    candidate = (
+                        next_arrival,
+                        rides + 1,
+                        next_ids,
+                        frozenset(next_ids),
+                        frozenset(visited + (next_station,)),
+                    )
+                    if any(
+                        _dominates(kept, candidate)
+                        for kept in settled.get(next_station, [])
+                    ):
+                        continue
                     leg = {
                         "service_id": svc.service_id,
                         "from_station": station,
@@ -173,7 +243,7 @@ class _Planner:
                         (
                             next_arrival,
                             rides + 1,
-                            service_ids + (svc.service_id,),
+                            next_ids,
                             next_station,
                             visited + (next_station,),
                             legs + (leg,),
